@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +19,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,7 +38,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -33,8 +46,103 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
+	fmt.Printf("Worker %v available\n", os.Getpid())
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
+
+	// Loop to require tasks from coordinator
+
+	for {
+		task := RequireTask()
+		if task == nil {
+			return
+		}
+		fmt.Printf("task: %v\n", task)
+		switch task.TaskType {
+		case "map":
+			doMap(task, mapf)
+
+		case "reduce":
+			doReduce(task, reducef)
+
+		case "retry":
+			continue
+
+		case "wait":
+			time.Sleep(3 * time.Second)
+
+		case "exit":
+			return
+
+		default:
+		}
+	}
+
+}
+
+func RequireTask() *TaskReply {
+	reqst := new(TaskRequest)
+	reply := new(TaskReply)
+
+	ok := call("Coordinator.AssignTask", reqst, reply)
+	if ok {
+		fmt.Printf("get %v task %v\n", reply.TaskType, reply.TaskId)
+	} else {
+		fmt.Printf("get task failed\n")
+		reply = nil
+	}
+	return reply
+}
+
+func doMap(task *TaskReply, mapf func(string, string) []KeyValue) {
+
+	file, err := os.Open(task.Filepath[0])
+	if err != nil {
+		log.Fatalf("worker: cannot open %v\n", task.Filepath)
+	}
+	defer file.Close()
+
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("worker: cannot read %v\n", task.Filepath)
+	}
+
+	// Divide into nReduce intermediate files
+	kva := mapf(task.Filepath[0], string(content))
+
+	sort.Sort(ByKey(kva))
+
+	oname := make([]string, task.NReduce)
+	ofile := make([]*os.File, task.NReduce)
+	enc := make([]*json.Encoder, task.NReduce)
+	prefix := fmt.Sprintf("mr-%d-", task.TaskId)
+
+	for y := 0; y < task.NReduce; y++ {
+		// TODO: Replace them with temp files first
+		oname[y] = fmt.Sprint(prefix, y)
+		ofile[y], _ = os.Create(oname[y])
+		defer ofile[y].Close()
+		// fmt.Printf("worker: writing %v...\n", oname)
+		enc[y] = json.NewEncoder(ofile[y])
+
+	}
+	for _, kv := range kva {
+		reduceId := ihash(kv.Key) % task.NReduce
+		err := enc[reduceId].Encode(&kv)
+		if err != nil {
+			log.Fatalf("worker: writing intermediate file failed\n")
+		}
+	}
+
+	// Send notice to coordinator
+	notice := new(TaskNotice)
+	notice.TaskId = task.TaskId
+	notice.TaskType = "map"
+	notice.OFilepath = append(notice.OFilepath, oname...)
+	call("Coordinator.NoticeTaskDone", notice, nil)
+}
+
+func doReduce(task *TaskReply, reducef func(string, []string) string) {
 
 }
 
