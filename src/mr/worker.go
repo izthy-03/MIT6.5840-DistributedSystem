@@ -57,7 +57,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		if task == nil {
 			return
 		}
-		fmt.Printf("task: %v\n", task)
+		fmt.Printf("	task: %v\n", task)
 		switch task.TaskType {
 		case "map":
 			doMap(task, mapf)
@@ -86,9 +86,9 @@ func RequireTask() *TaskReply {
 
 	ok := call("Coordinator.AssignTask", reqst, reply)
 	if ok {
-		fmt.Printf("get %v task %v\n", reply.TaskType, reply.TaskId)
+		fmt.Printf("%v: get %v task %v\n", os.Getpid(), reply.TaskType, reply.TaskId)
 	} else {
-		fmt.Printf("get task failed\n")
+		fmt.Printf("%v: get task failed\n", os.Getpid())
 		reply = nil
 	}
 	return reply
@@ -98,13 +98,13 @@ func doMap(task *TaskReply, mapf func(string, string) []KeyValue) {
 
 	file, err := os.Open(task.Filepath[0])
 	if err != nil {
-		log.Fatalf("worker: cannot open %v\n", task.Filepath)
+		log.Fatalf("Worker: cannot open %v\n", task.Filepath)
 	}
 	defer file.Close()
 
 	content, err := io.ReadAll(file)
 	if err != nil {
-		log.Fatalf("worker: cannot read %v\n", task.Filepath)
+		log.Fatalf("Worker: cannot read %v\n", task.Filepath)
 	}
 
 	// Divide into nReduce intermediate files
@@ -143,6 +143,60 @@ func doMap(task *TaskReply, mapf func(string, string) []KeyValue) {
 }
 
 func doReduce(task *TaskReply, reducef func(string, []string) string) {
+
+	kva := []KeyValue{}
+
+	for _, filepath := range task.Filepath {
+		file, err := os.Open(filepath)
+		if err != nil {
+			log.Fatalf("worker: cannot open %v\n", task.Filepath)
+		}
+		defer file.Close()
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+
+	sort.Sort(ByKey(kva))
+
+	oname := fmt.Sprintf("mr-out-%d", task.TaskId)
+	ofile, _ := os.Create(oname)
+	defer ofile.Close()
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+
+	// Send notice to coordinator
+	notice := new(TaskNotice)
+	notice.TaskId = task.TaskId
+	notice.TaskType = "reduce"
+	notice.OFilepath = append(notice.OFilepath, oname)
+	call("Coordinator.NoticeTaskDone", notice, nil)
 
 }
 

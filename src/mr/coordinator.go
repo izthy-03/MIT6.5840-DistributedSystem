@@ -71,8 +71,11 @@ func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 
 	reply.NReduce = c.nReduce
 
+	mdone := c.mapDone()
+	rdone := c.reduceDone()
+
 	// Check if all map tasks done
-	if !c.mtask.done {
+	if !mdone {
 
 		c.mtask.lock.Lock()
 		defer c.mtask.lock.Unlock()
@@ -103,7 +106,7 @@ func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 			}
 		}()
 
-	} else if !c.rtask.done {
+	} else if !rdone {
 		// Assign a reduce task
 		c.rtask.lock.Lock()
 		defer c.rtask.lock.Unlock()
@@ -148,7 +151,7 @@ func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 func (c *Coordinator) NoticeTaskDone(notice *TaskNotice, reply *TaskReply) error {
 	switch notice.TaskType {
 	case "map":
-		fmt.Printf("Map task %v done from worker\n", notice.TaskId)
+		fmt.Printf("> Map task %v done from worker\n", notice.TaskId)
 
 		c.mtask.lock.Lock()
 
@@ -162,12 +165,24 @@ func (c *Coordinator) NoticeTaskDone(notice *TaskNotice, reply *TaskReply) error
 
 		if c.mtask.fileNum == 0 {
 			c.mtask.done = true
-			fmt.Printf("Coordinator: All map tasks done.\n")
+			fmt.Printf(">> Coordinator: All map tasks done.\n")
 			// TODO: wake up all sleeping workers
 		}
 		c.mtask.lock.Unlock()
 
 	case "reduce":
+		fmt.Printf("> Reduce task %v done from worker\n", notice.TaskId)
+
+		c.rtask.lock.Lock()
+
+		c.rtask.rstatus[notice.TaskId] = DONE
+		c.rtask.reduceNum--
+
+		if c.rtask.reduceNum == 0 {
+			c.rtask.done = true
+			fmt.Printf(">> Coordinator: All reduce tasks done\n")
+		}
+		c.rtask.lock.Unlock()
 	}
 	return nil
 }
@@ -184,7 +199,11 @@ func (c *Coordinator) assignMap() int {
 		}
 		flag = flag && (status == DONE)
 	}
-	c.mtask.done = flag
+	if flag {
+		c.mtask.lock.Lock()
+		defer c.mtask.lock.Unlock()
+		c.mtask.done = flag
+	}
 	return -1
 }
 
@@ -200,7 +219,12 @@ func (c *Coordinator) assignReduce() int {
 		}
 		flag = flag && (status == DONE)
 	}
-	c.rtask.done = flag
+	if flag {
+		c.rtask.lock.Lock()
+		defer c.rtask.lock.Unlock()
+		c.rtask.done = flag
+	}
+
 	return -1
 }
 
@@ -220,6 +244,18 @@ func (r *ReduceTask) matchFiles(reduceid int) []string {
 		}
 	}
 	return match
+}
+
+func (c *Coordinator) mapDone() bool {
+	c.mtask.lock.Lock()
+	defer c.mtask.lock.Unlock()
+	return c.mtask.done
+}
+
+func (c *Coordinator) reduceDone() bool {
+	c.rtask.lock.Lock()
+	defer c.rtask.lock.Unlock()
+	return c.rtask.done
 }
 
 func (e *CoordError) Error() string {
@@ -250,6 +286,7 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
+	ret = c.mapDone() && c.reduceDone()
 
 	return ret
 }
