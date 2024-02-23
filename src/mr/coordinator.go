@@ -70,6 +70,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 
 func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 
+	// Suspend the worker when no free tasks
 	if !c.valid() {
 		c.gotoSleep(reqst.Pid)
 	}
@@ -113,7 +114,7 @@ func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 			if c.mtask.mstate[mapid] != DONE {
 				c.mtask.mstate[mapid] = TIMEDOUT
 				fmt.Printf("Map task %v timed out\n", mapid)
-				// TODO: wake up all workers
+				// wake up all workers
 				c.enable()
 				fmt.Printf("Waking up all workers...\n")
 				c.cond.Broadcast()
@@ -191,8 +192,8 @@ func (c *Coordinator) NoticeTaskDone(notice *TaskNotice, reply *TaskReply) error
 			fmt.Printf(">> Coordinator: All map tasks done.\n")
 			fmt.Printf("Waking up all workers...\n")
 			c.mtask.lock.Unlock()
-			// TODO: wake up all sleeping workers
 
+			// wake up all sleeping workers
 			c.enable()
 			c.cond.Broadcast()
 		} else {

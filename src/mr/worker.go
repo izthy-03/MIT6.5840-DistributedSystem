@@ -70,6 +70,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		case "wait":
 			time.Sleep(3 * time.Second)
+			continue
 
 		case "exit":
 			return
