@@ -25,7 +25,8 @@ const TIMEOUTSEC = 10
 
 type Coordinator struct {
 	// Your definitions here.
-	lock sync.Mutex
+	cond      *sync.Cond
+	available bool // whether any unassigned tasks
 
 	nReduce int
 	taskNum int
@@ -38,7 +39,7 @@ type MapTask struct {
 	lock      sync.Mutex
 	fileNum   int
 	filenames []string
-	mstatus   []int // status of M map tasks
+	mstate    []int // status of M map tasks
 	done      bool
 }
 
@@ -46,7 +47,7 @@ type ReduceTask struct {
 	lock      sync.Mutex
 	reduceNum int
 	filenames []string
-	rstatus   []int // status of R reduce tasks
+	rstate    []int // status of R reduce tasks
 	done      bool
 }
 
@@ -69,6 +70,10 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 
 func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 
+	if !c.valid() {
+		c.gotoSleep(reqst.Pid)
+	}
+
 	reply.NReduce = c.nReduce
 
 	mdone := c.mapDone()
@@ -78,13 +83,16 @@ func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 	if !mdone {
 
 		c.mtask.lock.Lock()
-		defer c.mtask.lock.Unlock()
 		mapid := c.assignMap()
 
 		// All map tasks assigned or done, please wait
 		if mapid == -1 {
 			// TODO: go to sleep
-			reply.TaskType = "wait"
+			// reply.TaskType = "wait"
+			c.mtask.lock.Unlock()
+
+			c.gotoSleep(reqst.Pid)
+			reply.TaskType = "retry"
 			return nil
 		}
 
@@ -92,28 +100,38 @@ func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 		reply.TaskType = "map"
 		reply.TaskId = mapid
 		reply.Filepath = append(reply.Filepath, c.mtask.filenames[mapid])
-		c.mtask.mstatus[mapid] = ASSIGNED
+		c.mtask.mstate[mapid] = ASSIGNED
+
+		c.mtask.lock.Unlock()
 
 		// Check timeout
 		go func() {
 			time.Sleep(TIMEOUTSEC * time.Second)
 			c.mtask.lock.Lock()
 			defer c.mtask.lock.Unlock()
-			if c.mtask.mstatus[mapid] != DONE {
-				c.mtask.mstatus[mapid] = TIMEDOUT
+
+			if c.mtask.mstate[mapid] != DONE {
+				c.mtask.mstate[mapid] = TIMEDOUT
 				fmt.Printf("Map task %v timed out\n", mapid)
 				// TODO: wake up all workers
+				c.enable()
+				fmt.Printf("Waking up all workers...\n")
+				c.cond.Broadcast()
 			}
+
 		}()
 
 	} else if !rdone {
 		// Assign a reduce task
 		c.rtask.lock.Lock()
-		defer c.rtask.lock.Unlock()
 
 		reduceid := c.assignReduce()
 		if reduceid == -1 {
-			reply.TaskType = "wait"
+			// reply.TaskType = "wait"
+			c.rtask.lock.Unlock()
+
+			c.gotoSleep(reqst.Pid)
+			reply.TaskType = "retry"
 			return nil
 		}
 		reducefiles := c.rtask.matchFiles(reduceid)
@@ -125,17 +143,22 @@ func (c *Coordinator) AssignTask(reqst *TaskRequest, reply *TaskReply) error {
 		reply.TaskType = "reduce"
 		reply.TaskId = reduceid
 		reply.Filepath = reducefiles
-		c.rtask.rstatus[reduceid] = ASSIGNED
+		c.rtask.rstate[reduceid] = ASSIGNED
+
+		c.rtask.lock.Unlock()
 
 		// Check timeout
 		go func() {
 			time.Sleep(TIMEOUTSEC * time.Second)
 			c.rtask.lock.Lock()
 			defer c.rtask.lock.Unlock()
-			if c.rtask.rstatus[reduceid] != DONE {
-				c.rtask.rstatus[reduceid] = TIMEDOUT
+			if c.rtask.rstate[reduceid] != DONE {
+				c.rtask.rstate[reduceid] = TIMEDOUT
 				fmt.Printf("Reduce task %v timed out\n", reduceid)
 				// TODO: wake up all workers
+				c.enable()
+				fmt.Printf("Waking up all workers...\n")
+				c.cond.Broadcast()
 			}
 		}()
 
@@ -155,7 +178,7 @@ func (c *Coordinator) NoticeTaskDone(notice *TaskNotice, reply *TaskReply) error
 
 		c.mtask.lock.Lock()
 
-		c.mtask.mstatus[notice.TaskId] = DONE
+		c.mtask.mstate[notice.TaskId] = DONE
 		c.mtask.fileNum--
 
 		// Add to reduce tasks
@@ -166,23 +189,35 @@ func (c *Coordinator) NoticeTaskDone(notice *TaskNotice, reply *TaskReply) error
 		if c.mtask.fileNum == 0 {
 			c.mtask.done = true
 			fmt.Printf(">> Coordinator: All map tasks done.\n")
+			fmt.Printf("Waking up all workers...\n")
+			c.mtask.lock.Unlock()
 			// TODO: wake up all sleeping workers
+
+			c.enable()
+			c.cond.Broadcast()
+		} else {
+			c.mtask.lock.Unlock()
 		}
-		c.mtask.lock.Unlock()
 
 	case "reduce":
 		fmt.Printf("> Reduce task %v done from worker\n", notice.TaskId)
 
 		c.rtask.lock.Lock()
 
-		c.rtask.rstatus[notice.TaskId] = DONE
+		c.rtask.rstate[notice.TaskId] = DONE
 		c.rtask.reduceNum--
 
 		if c.rtask.reduceNum == 0 {
 			c.rtask.done = true
 			fmt.Printf(">> Coordinator: All reduce tasks done\n")
+			fmt.Printf("Waking up all workers...\n")
+			c.rtask.lock.Unlock()
+
+			c.enable()
+			c.cond.Broadcast()
+		} else {
+			c.rtask.lock.Unlock()
 		}
-		c.rtask.lock.Unlock()
 	}
 	return nil
 }
@@ -193,16 +228,19 @@ func (c *Coordinator) NoticeTaskDone(notice *TaskNotice, reply *TaskReply) error
 //
 func (c *Coordinator) assignMap() int {
 	flag := true
-	for i, status := range c.mtask.mstatus {
+	for i, status := range c.mtask.mstate {
 		if status == UNASSIGNED || status == TIMEDOUT {
 			return i
 		}
 		flag = flag && (status == DONE)
 	}
+
 	if flag {
-		c.mtask.lock.Lock()
-		defer c.mtask.lock.Unlock()
+		// Map task done
 		c.mtask.done = flag
+	} else {
+		// All assigned
+		c.disable()
 	}
 	return -1
 }
@@ -213,19 +251,32 @@ func (c *Coordinator) assignMap() int {
 //
 func (c *Coordinator) assignReduce() int {
 	flag := true
-	for i, status := range c.rtask.rstatus {
+	for i, status := range c.rtask.rstate {
 		if status == UNASSIGNED || status == TIMEDOUT {
 			return i
 		}
 		flag = flag && (status == DONE)
 	}
-	if flag {
-		c.rtask.lock.Lock()
-		defer c.rtask.lock.Unlock()
-		c.rtask.done = flag
-	}
 
+	if flag {
+		c.rtask.done = flag
+	} else {
+		c.disable()
+	}
 	return -1
+}
+
+//
+//	Put the worker to sleep when no available tasks
+//
+func (c *Coordinator) gotoSleep(wid int) {
+	c.cond.L.Lock()
+	if !c.available {
+		fmt.Printf("Put worker %v to sleep\n", wid)
+		c.cond.Wait()
+	}
+	c.cond.L.Unlock()
+	fmt.Printf("Worker %v awaked\n", wid)
 }
 
 //
@@ -256,6 +307,23 @@ func (c *Coordinator) reduceDone() bool {
 	c.rtask.lock.Lock()
 	defer c.rtask.lock.Unlock()
 	return c.rtask.done
+}
+
+func (c *Coordinator) valid() bool {
+	c.cond.L.Lock()
+	defer c.cond.L.Unlock()
+	return c.available
+}
+
+func (c *Coordinator) enable() {
+	c.cond.L.Lock()
+	c.available = true
+	c.cond.L.Unlock()
+}
+func (c *Coordinator) disable() {
+	c.cond.L.Lock()
+	c.available = false
+	c.cond.L.Unlock()
 }
 
 func (e *CoordError) Error() string {
@@ -300,8 +368,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
+	c.cond = sync.NewCond(&sync.Mutex{})
 	c.nReduce = nReduce
 	c.taskNum = 0
+	c.available = true
 
 	// Read original files for map tasks
 	inputfilePattern := "../pg*txt"
@@ -311,14 +381,14 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 	c.mtask.filenames = filenames
 	c.mtask.fileNum = len(filenames)
-	c.mtask.mstatus = make([]int, len(filenames))
+	c.mtask.mstate = make([]int, len(filenames))
 	c.mtask.done = false
 	// fmt.Println(filenames)
 	// fmt.Println(c.mtask.mstatus)
 
 	// Initialize reduce tasks
 	c.rtask.reduceNum = nReduce
-	c.rtask.rstatus = make([]int, nReduce)
+	c.rtask.rstate = make([]int, nReduce)
 	c.rtask.done = false
 
 	c.server()

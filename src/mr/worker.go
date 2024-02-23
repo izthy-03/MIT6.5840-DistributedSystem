@@ -81,7 +81,7 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func RequireTask() *TaskReply {
-	reqst := new(TaskRequest)
+	reqst := &TaskRequest{Pid: os.Getpid()}
 	reply := new(TaskReply)
 
 	ok := call("Coordinator.AssignTask", reqst, reply)

@@ -27,7 +27,7 @@ type ExampleReply struct {
 // Add your RPC definitions here.
 
 type TaskRequest struct {
-	Test int
+	Pid int
 }
 
 type TaskNotice struct {
